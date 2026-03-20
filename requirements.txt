@@ -1,6 +1,5 @@
 streamlit
-opencv-python-headless
+streamlit-drawable-canvas
 numpy
 pandas
 pillow
-scikit-image
