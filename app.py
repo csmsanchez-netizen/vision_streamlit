@@ -1,15 +1,4 @@
-
-import math
-import heapq
-from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple
-
-import cv2
-import numpy as np
-import pandas as pd
-import streamlit as st
-from PIL import Image, ImageDraw
-from skimage.morphology import skeletonize
+skimage.morphology import skeletonize
 
 
 st.set_page_config(page_title="Medición morfológica con Streamlit", layout="wide")
@@ -336,14 +325,14 @@ if uploaded is not None:
         st.markdown(f"**Procesamiento:** {selected_candidate.name}")
         st.caption(f"Notas: {selected_candidate.notes} | Score automático: {selected_candidate.score}")
         st.image(
-            resize_for_display(selected_candidate.mask, max_display_width=max_display_width),
+            resize_for_display(selected_candidate.mask, max_width=max_display_width),
             caption="Máscara binaria resultante",
             use_container_width=True,
             clamp=True,
         )
     with col2:
         st.image(
-            resize_for_display(bgr_to_rgb(overlay), max_display_width=max_display_width),
+            resize_for_display(bgr_to_rgb(overlay), max_width=max_display_width),
             caption="Contornos detectados y numerados",
             use_container_width=True,
         )
@@ -440,7 +429,7 @@ if uploaded is not None:
 
         overlay_target = draw_numbered_contours(image_bgr, approved_candidate.contours, selected_idx=target_idx)
         st.image(
-            resize_for_display(bgr_to_rgb(overlay_target), max_display_width=max_display_width),
+            resize_for_display(bgr_to_rgb(overlay_target), max_width=max_display_width),
             caption="Contorno objetivo resaltado",
             use_container_width=True,
         )
@@ -480,3 +469,4 @@ if uploaded is not None:
         )
 else:
     st.info("Carga una imagen para comenzar.")
+
