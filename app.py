@@ -1,4 +1,4 @@
-skimage.morphology import skeletonize
+from skimage.morphology import skeletonize
 
 
 st.set_page_config(page_title="Medición morfológica con Streamlit", layout="wide")
