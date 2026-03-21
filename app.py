@@ -1,142 +1,221 @@
-
-import math
-import json
-from typing import List, Tuple, Optional
-
+import cv2
 import numpy as np
-import pandas as pd
 import streamlit as st
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
+
+st.set_page_config(page_title="Evaluación y procesamiento morfológico", layout="wide")
 
 
-st.set_page_config(page_title="Medición manual sobre imagen", layout="wide")
+def pil_to_rgb(image: Image.Image) -> np.ndarray:
+    return np.array(image.convert("RGB"))
 
 
-# -----------------------------
-# Utilidades geométricas
-# -----------------------------
-def distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
-    return float(math.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+def resize_keep_aspect(img: np.ndarray, max_width: int = 900) -> np.ndarray:
+    h, w = img.shape[:2]
+    if w <= max_width:
+        return img
+    scale = max_width / w
+    new_size = (int(w * scale), int(h * scale))
+    return cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
 
 
-def polyline_length(points: List[Tuple[float, float]]) -> float:
-    if len(points) < 2:
-        return 0.0
-    return sum(distance(points[i], points[i + 1]) for i in range(len(points) - 1))
+def grayscale(img_rgb: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
 
-def polygon_area(points: List[Tuple[float, float]]) -> float:
-    if len(points) < 3:
-        return 0.0
-    x = np.array([p[0] for p in points], dtype=float)
-    y = np.array([p[1] for p in points], dtype=float)
-    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+def auto_otsu_foreground(gray_blur: np.ndarray):
+    _, th_bin = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, th_inv = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    ratio_bin = float(np.mean(th_bin > 0))
+    ratio_inv = float(np.mean(th_inv > 0))
+
+    target = 0.10
+    score_bin = abs(ratio_bin - target)
+    score_inv = abs(ratio_inv - target)
+
+    if score_bin < score_inv:
+        return th_bin, {"ratio": ratio_bin, "polarity": "THRESH_BINARY"}
+    return th_inv, {"ratio": ratio_inv, "polarity": "THRESH_BINARY_INV"}
 
 
-def polygon_perimeter(points: List[Tuple[float, float]], closed: bool = True) -> float:
-    if len(points) < 2:
-        return 0.0
-    per = polyline_length(points)
-    if closed:
-        per += distance(points[-1], points[0])
-    return per
+def remove_small_components(mask: np.ndarray, min_area: int = 300):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    clean = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            clean[labels == i] = 255
+    return clean
 
 
-def extract_points_from_path(path_data) -> List[Tuple[float, float]]:
-    """
-    path_data suele venir como lista estilo Fabric.js:
-    [['M', x, y], ['Q', cx, cy, x, y], ['L', x, y], ...]
-    Aproximamos tomando los puntos finales de cada segmento.
-    """
-    points = []
-    if not isinstance(path_data, list):
-        return points
+def remove_border_touching_components(mask: np.ndarray, min_area: int = 50):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    clean = np.zeros_like(mask)
+    removed = 0
+    h, w = mask.shape
 
-    for cmd in path_data:
-        if not isinstance(cmd, list) or len(cmd) < 3:
+    for i in range(1, num_labels):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        ww = int(stats[i, cv2.CC_STAT_WIDTH])
+        hh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+
+        touches_border = (x == 0) or (y == 0) or (x + ww >= w) or (y + hh >= h)
+
+        if touches_border and area >= min_area:
+            removed += 1
             continue
-        tag = cmd[0]
-        if tag == "M" and len(cmd) >= 3:
-            points.append((float(cmd[1]), float(cmd[2])))
-        elif tag == "L" and len(cmd) >= 3:
-            points.append((float(cmd[1]), float(cmd[2])))
-        elif tag == "Q" and len(cmd) >= 5:
-            points.append((float(cmd[3]), float(cmd[4])))
-        elif tag == "C" and len(cmd) >= 7:
-            points.append((float(cmd[5]), float(cmd[6])))
-        elif tag == "Z":
-            pass
-    return points
+
+        clean[labels == i] = 255
+
+    return clean, removed
 
 
-def object_to_line_length_px(obj: dict) -> Optional[float]:
-    if obj.get("type") != "line":
-        return None
-    x1 = float(obj.get("x1", 0))
-    y1 = float(obj.get("y1", 0))
-    x2 = float(obj.get("x2", 0))
-    y2 = float(obj.get("y2", 0))
-    scale_x = float(obj.get("scaleX", 1))
-    scale_y = float(obj.get("scaleY", 1))
-    return distance((x1 * scale_x, y1 * scale_y), (x2 * scale_x, y2 * scale_y))
+def component_metrics(mask: np.ndarray):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    metrics = []
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        w = int(stats[i, cv2.CC_STAT_WIDTH])
+        h = int(stats[i, cv2.CC_STAT_HEIGHT])
+
+        comp = np.zeros_like(mask)
+        comp[labels == i] = 255
+        cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        cnt = max(cnts, key=cv2.contourArea)
+        peri = cv2.arcLength(cnt, True)
+        area_cnt = cv2.contourArea(cnt)
+        circularity = 4 * np.pi * area_cnt / (peri * peri) if peri > 0 else 0.0
+        aspect_ratio = max(w / max(h, 1), h / max(w, 1))
+        metrics.append(
+            {
+                "label": i,
+                "area": area,
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "circularity": float(circularity),
+                "aspect_ratio": float(aspect_ratio),
+            }
+        )
+    return metrics
 
 
-def object_to_circle_diameter_px(obj: dict) -> Optional[float]:
-    if obj.get("type") != "circle":
-        return None
-    radius = float(obj.get("radius", 0))
-    scale_x = float(obj.get("scaleX", 1))
-    scale_y = float(obj.get("scaleY", 1))
-    # Si la figura se deformó, usamos promedio de diámetros X/Y
-    diameter_x = 2 * radius * scale_x
-    diameter_y = 2 * radius * scale_y
-    return float((diameter_x + diameter_y) / 2.0)
+def overlay_components(img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    overlay = img_rgb.copy()
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 3)
+    return overlay
 
 
-def object_to_path_points(obj: dict) -> List[Tuple[float, float]]:
-    obj_type = obj.get("type")
-    left = float(obj.get("left", 0))
-    top = float(obj.get("top", 0))
-    scale_x = float(obj.get("scaleX", 1))
-    scale_y = float(obj.get("scaleY", 1))
+def evaluate_photo_quality(gray: np.ndarray, initial_mask: np.ndarray, final_mask: np.ndarray):
+    fg = gray[final_mask > 0]
+    bg = gray[final_mask == 0]
+    contrast = abs(float(np.mean(fg)) - float(np.mean(bg))) if len(fg) and len(bg) else 0.0
 
-    if obj_type == "path":
-        raw_points = extract_points_from_path(obj.get("path", []))
-        pts = [(left + x * scale_x, top + y * scale_y) for x, y in raw_points]
-        return pts
+    h, w = initial_mask.shape
+    border = np.zeros_like(initial_mask, dtype=bool)
+    border_margin_h = max(5, int(0.03 * h))
+    border_margin_w = max(5, int(0.03 * w))
+    border[:border_margin_h, :] = True
+    border[-border_margin_h:, :] = True
+    border[:, :border_margin_w] = True
+    border[:, -border_margin_w:] = True
 
-    if obj_type == "line":
-        x1 = float(obj.get("x1", 0)) * scale_x
-        y1 = float(obj.get("y1", 0)) * scale_y
-        x2 = float(obj.get("x2", 0)) * scale_x
-        y2 = float(obj.get("y2", 0)) * scale_y
-        return [(x1, y1), (x2, y2)]
+    total_fg_initial = int(np.sum(initial_mask > 0))
+    border_fg_initial = int(np.sum((initial_mask > 0) & border))
+    border_noise_ratio = border_fg_initial / max(total_fg_initial, 1)
 
-    return []
+    comps = component_metrics(final_mask)
+    component_count = len(comps)
+    elongated_count = sum(1 for c in comps if c["aspect_ratio"] >= 2.5)
+    circular_count = sum(1 for c in comps if c["circularity"] >= 0.65)
+
+    reasons = []
+    ok = True
+    if contrast < 35:
+        ok = False
+        reasons.append("Contraste bajo entre objeto y fondo.")
+    if component_count < 2:
+        ok = False
+        reasons.append("No se aislaron al menos dos objetos principales.")
+    if elongated_count < 1:
+        ok = False
+        reasons.append("No se detectó claramente un objeto alargado como la fibra.")
+    if circular_count < 1:
+        ok = False
+        reasons.append("No se detectó claramente un objeto circular como la moneda.")
+    if border_noise_ratio > 0.35:
+        ok = False
+        reasons.append("Existe demasiado ruido o interferencia pegada a los bordes.")
+
+    verdict = "APTA" if ok else "REPETIR FOTO"
+    return {
+        "verdict": verdict,
+        "contrast": contrast,
+        "border_noise_ratio": border_noise_ratio,
+        "component_count": component_count,
+        "elongated_count": elongated_count,
+        "circular_count": circular_count,
+        "reasons": reasons,
+    }
 
 
-def first_object_of_type(objects: List[dict], accepted_types: List[str]) -> Optional[dict]:
-    for obj in objects:
-        if obj.get("type") in accepted_types:
-            return obj
-    return None
+def process_image(img_rgb: np.ndarray, min_area: int = 300):
+    gray = grayscale(img_rgb)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    otsu_mask, otsu_meta = auto_otsu_foreground(blur)
+
+    kernel = np.ones((3, 3), np.uint8)
+    closed = cv2.morphologyEx(otsu_mask, cv2.MORPH_CLOSE, kernel)
+    cleaned_small = remove_small_components(closed, min_area=min_area)
+    final_mask, removed_border = remove_border_touching_components(cleaned_small, min_area=50)
+
+    overlay = overlay_components(img_rgb, final_mask)
+    quality = evaluate_photo_quality(gray, otsu_mask, final_mask)
+
+    return {
+        "gray": gray,
+        "blur": blur,
+        "otsu_mask": otsu_mask,
+        "otsu_meta": otsu_meta,
+        "closed": closed,
+        "cleaned_small": cleaned_small,
+        "final_mask": final_mask,
+        "overlay": overlay,
+        "quality": quality,
+        "removed_border_components": removed_border,
+    }
 
 
-def get_canvas_objects(canvas_result) -> List[dict]:
-    if canvas_result is None or canvas_result.json_data is None:
-        return []
-    return canvas_result.json_data.get("objects", [])
+def human_adjustments_text(meta: dict, removed_border: int, min_area: int):
+    return [
+        "1. Conversión a escala de grises para eliminar información de color innecesaria.",
+        "2. Suavizado gaussiano para reducir pequeñas variaciones y ruido local.",
+        f"3. Umbralización automática de Otsu usando polaridad {meta['polarity']} para separar objetos del fondo.",
+        "4. Cierre morfológico para cerrar pequeños huecos y volver más continuas las figuras.",
+        f"5. Eliminación de componentes pequeñas menores a {min_area} píxeles para retirar ruido aislado.",
+        f"6. Eliminación de componentes que tocan los bordes de la imagen. Componentes removidas: {removed_border}.",
+    ]
 
 
-# -----------------------------
-# Interfaz
-# -----------------------------
-st.title("Medición manual sobre imagen")
+st.title("Evaluación previa y procesamiento morfológico")
 st.caption(
-    "Esta versión evita la detección automática de contornos. "
-    "El usuario dibuja manualmente la referencia y las geometrías a medir."
+    "Carga una foto y la app evaluará si es adecuada para medición. "
+    "Luego mostrará el pipeline morfológico y el resultado final."
 )
+
+with st.sidebar:
+    st.header("Parámetros")
+    min_area = st.slider("Área mínima para conservar componentes", 50, 3000, 300, 50)
+    max_width = st.slider("Ancho máximo de visualización", 500, 1600, 900, 50)
 
 uploaded = st.file_uploader("Carga una imagen", type=["png", "jpg", "jpeg"])
 
@@ -145,229 +224,67 @@ if uploaded is None:
     st.stop()
 
 image = Image.open(uploaded).convert("RGB")
-img_w, img_h = image.size
+img_rgb = pil_to_rgb(image)
+results = process_image(img_rgb, min_area=min_area)
+quality = results["quality"]
 
-max_canvas_width = st.sidebar.slider("Ancho máximo del canvas", 500, 1400, 1000, 50)
-display_scale = min(max_canvas_width / img_w, 1.0)
-canvas_w = int(img_w * display_scale)
-canvas_h = int(img_h * display_scale)
+st.subheader("Evaluación previa de la foto")
+col_q1, col_q2, col_q3, col_q4 = st.columns(4)
+col_q1.metric("Veredicto", quality["verdict"])
+col_q2.metric("Contraste", f"{quality['contrast']:.1f}")
+col_q3.metric("Objetos útiles", str(quality["component_count"]))
+col_q4.metric("Ruido en bordes", f"{quality['border_noise_ratio']:.2f}")
 
-st.sidebar.markdown("### Recomendaciones")
-st.sidebar.write(
-    "- Usa **línea** para una longitud conocida.\n"
-    "- Usa **círculo** para una moneda o figura circular.\n"
-    "- Usa **trazo libre** para curvas o contornos."
-)
-
-st.subheader("Paso 1: referencia de escala")
-ref_mode = st.radio(
-    "Tipo de referencia",
-    ["Longitud conocida (línea)", "Diámetro conocido (círculo)"],
-    horizontal=True
-)
-
-ref_size_mm = st.number_input(
-    "Tamaño real de la referencia (mm)",
-    min_value=0.001,
-    value=24.0,
-    step=0.1,
-    format="%.3f"
-)
-
-ref_tool = "line" if "Longitud" in ref_mode else "circle"
-
-st.write("Dibuja **solo una** referencia sobre la imagen.")
-ref_canvas = st_canvas(
-    fill_color="rgba(255, 0, 0, 0.15)",
-    stroke_width=3,
-    stroke_color="#ff0000",
-    background_image=image,
-    update_streamlit=True,
-    height=canvas_h,
-    width=canvas_w,
-    drawing_mode=ref_tool,
-    key="ref_canvas",
-    display_toolbar=True,
-)
-
-ref_objects = get_canvas_objects(ref_canvas)
-
-if len(ref_objects) == 0:
-    st.warning("Aún no has dibujado la referencia.")
-    st.stop()
-
-ref_obj = first_object_of_type(ref_objects, ["line", "circle"])
-if ref_obj is None:
-    st.error("No se encontró un objeto válido para la referencia.")
-    st.stop()
-
-if ref_obj.get("type") == "line":
-    ref_px_display = object_to_line_length_px(ref_obj)
+if quality["verdict"] == "APTA":
+    st.success("La foto es adecuada para continuar con medición automática básica.")
 else:
-    ref_px_display = object_to_circle_diameter_px(ref_obj)
+    st.error("La foto no es adecuada. Se recomienda tomar otra antes de medir.")
+    if quality["reasons"]:
+        st.markdown("**Motivos detectados:**")
+        for r in quality["reasons"]:
+            st.write(f"- {r}")
 
-if ref_px_display is None or ref_px_display <= 0:
-    st.error("No fue posible calcular la referencia en píxeles.")
-    st.stop()
+st.subheader("Ajustes morfológicos aplicados")
+for item in human_adjustments_text(results["otsu_meta"], results["removed_border_components"], min_area):
+    st.write(item)
 
-# Convertir de pixeles del canvas a pixeles reales de la imagen
-ref_px_real = ref_px_display / display_scale
-px_per_mm = ref_px_real / ref_size_mm
-mm_per_px = 1.0 / px_per_mm
+st.subheader("Resultados visuales")
+c1, c2 = st.columns(2)
+with c1:
+    st.markdown("**Imagen original**")
+    st.image(resize_keep_aspect(img_rgb, max_width), use_container_width=True)
+with c2:
+    st.markdown("**Resultado final: máscara limpia**")
+    st.image(resize_keep_aspect(results["final_mask"], max_width), clamp=True, use_container_width=True)
 
-st.success(f"Escala calculada: {px_per_mm:.4f} px/mm  |  {mm_per_px:.4f} mm/px")
+c3, c4 = st.columns(2)
+with c3:
+    st.markdown("**Escala de grises**")
+    st.image(resize_keep_aspect(results["gray"], max_width), clamp=True, use_container_width=True)
+with c4:
+    st.markdown("**Suavizado gaussiano**")
+    st.image(resize_keep_aspect(results["blur"], max_width), clamp=True, use_container_width=True)
 
-st.subheader("Paso 2: longitud de la figura objetivo")
-length_mode = st.radio(
-    "Modo de longitud",
-    ["Línea recta", "Curva (trazo libre)"],
-    horizontal=True
-)
-length_tool = "line" if "Línea" in length_mode else "freedraw"
+c5, c6 = st.columns(2)
+with c5:
+    st.markdown(f"**Umbralización de Otsu** ({results['otsu_meta']['polarity']})")
+    st.image(resize_keep_aspect(results["otsu_mask"], max_width), clamp=True, use_container_width=True)
+with c6:
+    st.markdown("**Cierre morfológico**")
+    st.image(resize_keep_aspect(results["closed"], max_width), clamp=True, use_container_width=True)
 
-st.write("Dibuja la longitud del objeto. Si es curva, recórrela con trazo libre.")
-length_canvas = st_canvas(
-    fill_color="rgba(0, 0, 255, 0.05)",
-    stroke_width=3,
-    stroke_color="#0066ff",
-    background_image=image,
-    update_streamlit=True,
-    height=canvas_h,
-    width=canvas_w,
-    drawing_mode=length_tool,
-    key="length_canvas",
-    display_toolbar=True,
-)
-
-length_objects = get_canvas_objects(length_canvas)
-length_px_real = None
-
-if len(length_objects) > 0:
-    length_obj = length_objects[-1]
-    if length_obj.get("type") == "line":
-        length_px_display = object_to_line_length_px(length_obj)
-        if length_px_display:
-            length_px_real = length_px_display / display_scale
-    elif length_obj.get("type") == "path":
-        pts = object_to_path_points(length_obj)
-        if len(pts) >= 2:
-            length_px_display = polyline_length(pts)
-            length_px_real = length_px_display / display_scale
-
-st.subheader("Paso 3: diámetro")
-st.write("Dibuja una línea atravesando el diámetro que quieres reportar.")
-diam_canvas = st_canvas(
-    fill_color="rgba(0, 255, 0, 0.05)",
-    stroke_width=3,
-    stroke_color="#00aa00",
-    background_image=image,
-    update_streamlit=True,
-    height=canvas_h,
-    width=canvas_w,
-    drawing_mode="line",
-    key="diam_canvas",
-    display_toolbar=True,
-)
-
-diam_objects = get_canvas_objects(diam_canvas)
-diam_px_real = None
-
-if len(diam_objects) > 0:
-    diam_obj = first_object_of_type(diam_objects, ["line"])
-    if diam_obj:
-        diam_px_display = object_to_line_length_px(diam_obj)
-        if diam_px_display:
-            diam_px_real = diam_px_display / display_scale
-
-st.subheader("Paso 4: área y perímetro")
-st.write(
-    "Traza manualmente el contorno cerrado de la figura con **trazo libre**. "
-    "Mientras más fiel sea el trazo, mejor la estimación."
-)
-area_canvas = st_canvas(
-    fill_color="rgba(255, 165, 0, 0.08)",
-    stroke_width=3,
-    stroke_color="#ff8800",
-    background_image=image,
-    update_streamlit=True,
-    height=canvas_h,
-    width=canvas_w,
-    drawing_mode="freedraw",
-    key="area_canvas",
-    display_toolbar=True,
-)
-
-area_objects = get_canvas_objects(area_canvas)
-area_px2_real = None
-perimeter_px_real = None
-
-if len(area_objects) > 0:
-    area_obj = area_objects[-1]
-    if area_obj.get("type") == "path":
-        pts = object_to_path_points(area_obj)
-        if len(pts) >= 3:
-            area_px2_display = polygon_area(pts)
-            perimeter_px_display = polygon_perimeter(pts, closed=True)
-            area_px2_real = area_px2_display / (display_scale ** 2)
-            perimeter_px_real = perimeter_px_display / display_scale
-
-st.markdown("---")
-st.subheader("Resultados")
-
-results = []
-
-if length_px_real is not None:
-    results.append({
-        "Magnitud": "Longitud",
-        "Pixeles": round(length_px_real, 3),
-        "Milímetros": round(length_px_real / px_per_mm, 3),
-    })
-
-if diam_px_real is not None:
-    results.append({
-        "Magnitud": "Diámetro",
-        "Pixeles": round(diam_px_real, 3),
-        "Milímetros": round(diam_px_real / px_per_mm, 3),
-    })
-
-if area_px2_real is not None:
-    results.append({
-        "Magnitud": "Área",
-        "Pixeles": round(area_px2_real, 3),
-        "Milímetros": round(area_px2_real / (px_per_mm ** 2), 3),
-    })
-
-if perimeter_px_real is not None:
-    results.append({
-        "Magnitud": "Perímetro",
-        "Pixeles": round(perimeter_px_real, 3),
-        "Milímetros": round(perimeter_px_real / px_per_mm, 3),
-    })
-
-if results:
-    df = pd.DataFrame(results)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    cols = st.columns(min(4, len(results)))
-    metric_map = {row["Magnitud"]: row["Milímetros"] for row in results}
-    i = 0
-    for key in ["Longitud", "Diámetro", "Área", "Perímetro"]:
-        if key in metric_map:
-            unit = "mm²" if key == "Área" else "mm"
-            cols[i].metric(key, f"{metric_map[key]:.3f} {unit}")
-            i += 1
-else:
-    st.info("Dibuja las geometrías para ver resultados.")
+c7, c8 = st.columns(2)
+with c7:
+    st.markdown("**Limpieza por área mínima**")
+    st.image(resize_keep_aspect(results["cleaned_small"], max_width), clamp=True, use_container_width=True)
+with c8:
+    st.markdown("**Resultado final superpuesto**")
+    st.image(resize_keep_aspect(results["overlay"], max_width), use_container_width=True)
 
 st.markdown(
     """
-    ### Cómo usar esta versión
-    1. Dibuja una **referencia** de tamaño conocido.
-    2. Dibuja la **longitud** del objeto, incluso si es curva.
-    3. Dibuja una línea para el **diámetro**.
-    4. Traza manualmente el **contorno** para estimar área y perímetro.
-
-    ### Nota
-    Esta versión es más manual, pero te da control total cuando la segmentación automática no funciona bien.
-    """
+### Interpretación
+- Si la foto es **APTA**, ya tienes una base razonable para continuar con medición automática.
+- Si la foto dice **REPETIR FOTO**, normalmente conviene mejorar fondo, iluminación y orientación de la cámara antes de medir.
+"""
 )
