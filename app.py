@@ -6,6 +6,9 @@ from PIL import Image
 st.set_page_config(page_title="Evaluación y procesamiento morfológico", layout="wide")
 
 
+# -------------------------------------------------
+# Utilidades
+# -------------------------------------------------
 def pil_to_rgb(image: Image.Image) -> np.ndarray:
     return np.array(image.convert("RGB"))
 
@@ -23,6 +26,15 @@ def grayscale(img_rgb: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
 
+def auto_crop_left(img_rgb: np.ndarray, crop_left_pct: int) -> tuple[np.ndarray, int]:
+    if crop_left_pct <= 0:
+        return img_rgb.copy(), 0
+    h, w = img_rgb.shape[:2]
+    crop_px = int(w * crop_left_pct / 100.0)
+    cropped = img_rgb[:, crop_px:]
+    return cropped, crop_px
+
+
 def auto_otsu_foreground(gray_blur: np.ndarray):
     _, th_bin = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, th_inv = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -30,6 +42,7 @@ def auto_otsu_foreground(gray_blur: np.ndarray):
     ratio_bin = float(np.mean(th_bin > 0))
     ratio_inv = float(np.mean(th_inv > 0))
 
+    # Buscamos una fracción razonable de foreground
     target = 0.10
     score_bin = abs(ratio_bin - target)
     score_inv = abs(ratio_inv - target)
@@ -39,7 +52,7 @@ def auto_otsu_foreground(gray_blur: np.ndarray):
     return th_inv, {"ratio": ratio_inv, "polarity": "THRESH_BINARY_INV"}
 
 
-def remove_small_components(mask: np.ndarray, min_area: int = 300):
+def remove_small_components(mask: np.ndarray, min_area: int = 300) -> np.ndarray:
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     clean = np.zeros_like(mask)
     for i in range(1, num_labels):
@@ -140,6 +153,7 @@ def evaluate_photo_quality(gray: np.ndarray, initial_mask: np.ndarray, final_mas
 
     reasons = []
     ok = True
+
     if contrast < 35:
         ok = False
         reasons.append("Contraste bajo entre objeto y fondo.")
@@ -151,12 +165,13 @@ def evaluate_photo_quality(gray: np.ndarray, initial_mask: np.ndarray, final_mas
         reasons.append("No se detectó claramente un objeto alargado como la fibra.")
     if circular_count < 1:
         ok = False
-        reasons.append("No se detectó claramente un objeto circular como la moneda.")
+        reasons.append("No se detectó claramente un objeto circular como la referencia.")
     if border_noise_ratio > 0.35:
         ok = False
         reasons.append("Existe demasiado ruido o interferencia pegada a los bordes.")
 
     verdict = "APTA" if ok else "REPETIR FOTO"
+
     return {
         "verdict": verdict,
         "contrast": contrast,
@@ -168,53 +183,85 @@ def evaluate_photo_quality(gray: np.ndarray, initial_mask: np.ndarray, final_mas
     }
 
 
-def process_image(img_rgb: np.ndarray, min_area: int = 300):
-    gray = grayscale(img_rgb)
+def process_image(img_rgb: np.ndarray, min_area: int = 300, crop_left_pct: int = 0):
+    cropped_rgb, crop_px = auto_crop_left(img_rgb, crop_left_pct)
+
+    gray = grayscale(cropped_rgb)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
     otsu_mask, otsu_meta = auto_otsu_foreground(blur)
 
     kernel = np.ones((3, 3), np.uint8)
+
+    # Cierre para continuidad de objetos
     closed = cv2.morphologyEx(otsu_mask, cv2.MORPH_CLOSE, kernel)
-    cleaned_small = remove_small_components(closed, min_area=min_area)
+
+    # Apertura ligera para quitar pequeñas formaciones adicionales
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
+
+    # Eliminación de componentes pequeñas
+    cleaned_small = remove_small_components(opened, min_area=min_area)
+
+    # Eliminación de componentes pegadas al borde
     final_mask, removed_border = remove_border_touching_components(cleaned_small, min_area=50)
 
-    overlay = overlay_components(img_rgb, final_mask)
+    # Visualización más clara: objetos negros sobre fondo blanco
+    final_mask_white_bg = cv2.bitwise_not(final_mask)
+
+    overlay = overlay_components(cropped_rgb, final_mask)
     quality = evaluate_photo_quality(gray, otsu_mask, final_mask)
 
     return {
+        "cropped_rgb": cropped_rgb,
+        "crop_px": crop_px,
         "gray": gray,
         "blur": blur,
         "otsu_mask": otsu_mask,
-        "otsu_meta": otsu_meta,
         "closed": closed,
+        "opened": opened,
         "cleaned_small": cleaned_small,
         "final_mask": final_mask,
+        "final_mask_white_bg": final_mask_white_bg,
         "overlay": overlay,
         "quality": quality,
         "removed_border_components": removed_border,
+        "otsu_meta": otsu_meta,
     }
 
 
-def human_adjustments_text(meta: dict, removed_border: int, min_area: int):
-    return [
-        "1. Conversión a escala de grises para eliminar información de color innecesaria.",
-        "2. Suavizado gaussiano para reducir pequeñas variaciones y ruido local.",
-        f"3. Umbralización automática de Otsu usando polaridad {meta['polarity']} para separar objetos del fondo.",
-        "4. Cierre morfológico para cerrar pequeños huecos y volver más continuas las figuras.",
-        f"5. Eliminación de componentes pequeñas menores a {min_area} píxeles para retirar ruido aislado.",
-        f"6. Eliminación de componentes que tocan los bordes de la imagen. Componentes removidas: {removed_border}.",
-    ]
+def human_adjustments_text(meta: dict, removed_border: int, min_area: int, crop_left_pct: int):
+    items = []
+    if crop_left_pct > 0:
+        items.append(f"1. Recorte lateral izquierdo del {crop_left_pct}% para eliminar ruido pegado al borde.")
+        n = 2
+    else:
+        n = 1
+
+    items.extend([
+        f"{n}. Conversión a escala de grises para eliminar información de color innecesaria.",
+        f"{n+1}. Suavizado gaussiano para reducir pequeñas variaciones y ruido local.",
+        f"{n+2}. Umbralización automática de Otsu usando polaridad {meta['polarity']} para separar objetos del fondo.",
+        f"{n+3}. Cierre morfológico para volver más continuas las figuras.",
+        f"{n+4}. Apertura morfológica ligera para eliminar pequeñas formaciones adicionales.",
+        f"{n+5}. Eliminación de componentes pequeñas menores a {min_area} píxeles para retirar ruido aislado.",
+        f"{n+6}. Eliminación de componentes que tocan los bordes de la imagen. Componentes removidas: {removed_border}.",
+        f"{n+7}. Inversión de la máscara final solo para visualización, mostrando objetos negros sobre fondo blanco.",
+    ])
+    return items
 
 
+# -------------------------------------------------
+# Interfaz
+# -------------------------------------------------
 st.title("Evaluación previa y procesamiento morfológico")
 st.caption(
-    "Carga una foto y la app evaluará si es adecuada para medición. "
-    "Luego mostrará el pipeline morfológico y el resultado final."
+    "Carga una foto, evalúa si es adecuada y valida visualmente la detección antes de mostrar la máscara limpia final."
 )
 
 with st.sidebar:
     st.header("Parámetros")
     min_area = st.slider("Área mínima para conservar componentes", 50, 3000, 300, 50)
+    crop_left_pct = st.slider("Recorte izquierdo (%)", 0, 30, 0, 1)
     max_width = st.slider("Ancho máximo de visualización", 500, 1600, 900, 50)
 
 uploaded = st.file_uploader("Carga una imagen", type=["png", "jpg", "jpeg"])
@@ -225,7 +272,7 @@ if uploaded is None:
 
 image = Image.open(uploaded).convert("RGB")
 img_rgb = pil_to_rgb(image)
-results = process_image(img_rgb, min_area=min_area)
+results = process_image(img_rgb, min_area=min_area, crop_left_pct=crop_left_pct)
 quality = results["quality"]
 
 st.subheader("Evaluación previa de la foto")
@@ -236,26 +283,71 @@ col_q2.metric("Contraste", f"{quality['contrast']:.1f}")
 col_q3.metric("Objetos útiles", str(quality["component_count"]))
 col_q4.metric("Ruido en bordes", f"{quality['border_noise_ratio']:.2f}")
 
-# Mostrar imagen superpuesta para validación
-st.subheader("Vista previa del resultado")
-st.image(results["overlay"], caption="Detección sobre imagen original")
+if quality["verdict"] == "APTA":
+    st.success("La foto es adecuada para continuar con el análisis.")
+else:
+    st.error("La foto no es adecuada. Se recomienda tomar otra antes de medir.")
+    if quality["reasons"]:
+        st.markdown("**Motivos detectados:**")
+        for r in quality["reasons"]:
+            st.write(f"- {r}")
 
-# Pregunta al usuario
-st.subheader("Confirmación")
+st.subheader("Ajustes morfológicos aplicados")
+for item in human_adjustments_text(results["otsu_meta"], results["removed_border_components"], min_area, crop_left_pct):
+    st.write(item)
+
+st.subheader("Vista previa para validación")
+st.image(resize_keep_aspect(results["overlay"], max_width), caption="Detección sobre imagen original", use_container_width=True)
 
 decision = st.radio(
-    "¿Está de acuerdo con la detección?",
-    ["Sí, continuar", "No, cargar otra imagen"]
+    "¿Está de acuerdo con esta detección o desea cargar una nueva imagen?",
+    ["Sí, estoy de acuerdo", "No, cargaré una nueva imagen"],
+    horizontal=True,
 )
 
-# Lógica de decisión
-if decision == "No, cargar otra imagen":
-    st.warning("Por favor, cargue una nueva imagen con mejor calidad.")
+if decision == "No, cargaré una nueva imagen":
+    st.warning("Cargue una nueva imagen para repetir el análisis.")
     st.stop()
 
-# Si el usuario acepta, continuar
-st.success("Imagen aceptada. Mostrando máscara limpia para análisis.")
+st.success("Imagen aceptada. Se muestra la máscara limpia final para análisis.")
 
-# Mostrar máscara final
-st.subheader("Resultado final para análisis (máscara limpia)")
-st.image(results["final_mask"], clamp=True)
+st.subheader("Resultado final: máscara limpia")
+st.image(
+    resize_keep_aspect(results["final_mask_white_bg"], max_width),
+    caption="Máscara limpia final (objetos negros sobre fondo blanco)",
+    clamp=True,
+    use_container_width=True,
+)
+
+with st.expander("Ver pasos intermedios del procesamiento"):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Imagen original o recortada**")
+        st.image(resize_keep_aspect(results["cropped_rgb"], max_width), use_container_width=True)
+    with c2:
+        st.markdown("**Escala de grises**")
+        st.image(resize_keep_aspect(results["gray"], max_width), clamp=True, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("**Suavizado gaussiano**")
+        st.image(resize_keep_aspect(results["blur"], max_width), clamp=True, use_container_width=True)
+    with c4:
+        st.markdown(f"**Umbralización de Otsu** ({results['otsu_meta']['polarity']})")
+        st.image(resize_keep_aspect(results["otsu_mask"], max_width), clamp=True, use_container_width=True)
+
+    c5, c6 = st.columns(2)
+    with c5:
+        st.markdown("**Cierre morfológico**")
+        st.image(resize_keep_aspect(results["closed"], max_width), clamp=True, use_container_width=True)
+    with c6:
+        st.markdown("**Apertura morfológica**")
+        st.image(resize_keep_aspect(results["opened"], max_width), clamp=True, use_container_width=True)
+
+    c7, c8 = st.columns(2)
+    with c7:
+        st.markdown("**Limpieza por área mínima**")
+        st.image(resize_keep_aspect(results["cleaned_small"], max_width), clamp=True, use_container_width=True)
+    with c8:
+        st.markdown("**Superposición final**")
+        st.image(resize_keep_aspect(results["overlay"], max_width), use_container_width=True)
