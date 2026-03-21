@@ -229,62 +229,33 @@ results = process_image(img_rgb, min_area=min_area)
 quality = results["quality"]
 
 st.subheader("Evaluación previa de la foto")
+
 col_q1, col_q2, col_q3, col_q4 = st.columns(4)
 col_q1.metric("Veredicto", quality["verdict"])
 col_q2.metric("Contraste", f"{quality['contrast']:.1f}")
 col_q3.metric("Objetos útiles", str(quality["component_count"]))
 col_q4.metric("Ruido en bordes", f"{quality['border_noise_ratio']:.2f}")
 
-if quality["verdict"] == "APTA":
-    st.success("La foto es adecuada para continuar con medición automática básica.")
-else:
-    st.error("La foto no es adecuada. Se recomienda tomar otra antes de medir.")
-    if quality["reasons"]:
-        st.markdown("**Motivos detectados:**")
-        for r in quality["reasons"]:
-            st.write(f"- {r}")
+# Mostrar imagen superpuesta para validación
+st.subheader("Vista previa del resultado")
+st.image(results["overlay"], caption="Detección sobre imagen original")
 
-st.subheader("Ajustes morfológicos aplicados")
-for item in human_adjustments_text(results["otsu_meta"], results["removed_border_components"], min_area):
-    st.write(item)
+# Pregunta al usuario
+st.subheader("Confirmación")
 
-st.subheader("Resultados visuales")
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("**Imagen original**")
-    st.image(resize_keep_aspect(img_rgb, max_width), use_container_width=True)
-with c2:
-    st.markdown("**Resultado final: máscara limpia**")
-    st.image(resize_keep_aspect(results["final_mask"], max_width), clamp=True, use_container_width=True)
-
-c3, c4 = st.columns(2)
-with c3:
-    st.markdown("**Escala de grises**")
-    st.image(resize_keep_aspect(results["gray"], max_width), clamp=True, use_container_width=True)
-with c4:
-    st.markdown("**Suavizado gaussiano**")
-    st.image(resize_keep_aspect(results["blur"], max_width), clamp=True, use_container_width=True)
-
-c5, c6 = st.columns(2)
-with c5:
-    st.markdown(f"**Umbralización de Otsu** ({results['otsu_meta']['polarity']})")
-    st.image(resize_keep_aspect(results["otsu_mask"], max_width), clamp=True, use_container_width=True)
-with c6:
-    st.markdown("**Cierre morfológico**")
-    st.image(resize_keep_aspect(results["closed"], max_width), clamp=True, use_container_width=True)
-
-c7, c8 = st.columns(2)
-with c7:
-    st.markdown("**Limpieza por área mínima**")
-    st.image(resize_keep_aspect(results["cleaned_small"], max_width), clamp=True, use_container_width=True)
-with c8:
-    st.markdown("**Resultado final superpuesto**")
-    st.image(resize_keep_aspect(results["overlay"], max_width), use_container_width=True)
-
-st.markdown(
-    """
-### Interpretación
-- Si la foto es **APTA**, ya tienes una base razonable para continuar con medición automática.
-- Si la foto dice **REPETIR FOTO**, normalmente conviene mejorar fondo, iluminación y orientación de la cámara antes de medir.
-"""
+decision = st.radio(
+    "¿Está de acuerdo con la detección?",
+    ["Sí, continuar", "No, cargar otra imagen"]
 )
+
+# Lógica de decisión
+if decision == "No, cargar otra imagen":
+    st.warning("Por favor, cargue una nueva imagen con mejor calidad.")
+    st.stop()
+
+# Si el usuario acepta, continuar
+st.success("Imagen aceptada. Mostrando máscara limpia para análisis.")
+
+# Mostrar máscara final
+st.subheader("Resultado final para análisis (máscara limpia)")
+st.image(results["final_mask"], clamp=True)
